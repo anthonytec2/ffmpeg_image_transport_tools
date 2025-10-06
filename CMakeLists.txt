@@ -85,6 +85,23 @@ target_compile_features(bag_to_frames PRIVATE cxx_std_17)
 target_include_directories(bag_to_frames PRIVATE include)
 
 #
+# -------- bag_to_video
+#
+add_executable(bag_to_video  src/bag_to_video.cpp)
+target_link_libraries(bag_to_video
+  cv_bridge::cv_bridge
+  ffmpeg_encoder_decoder::ffmpeg_encoder_decoder
+  ${ffmpeg_image_transport_msgs_TARGETS}
+  rclcpp::rclcpp
+  rosbag2_cpp::rosbag2_cpp
+  rosbag2_storage::rosbag2_storage
+  opencv_core opencv_imgproc
+  ${sensor_msgs_TARGETS})
+
+target_compile_features(bag_to_video PRIVATE cxx_std_17)
+target_include_directories(bag_to_video PRIVATE include)
+
+#
 # -------- compress_bag
 #
 add_executable(compress_bag  src/compress_bag.cpp)
@@ -119,6 +136,7 @@ target_include_directories(uncompress_bag PRIVATE include)
 install(TARGETS
   bag_to_file
   bag_to_frames
+  bag_to_video
   compress_bag
   uncompress_bag
   DESTINATION lib/${PROJECT_NAME}/)
