@@ -39,23 +39,49 @@
 
 void usage()
 {
-  std::cout << "usage:\n\n"
-            << "bag_to_video -i input_bag -t topic -r framerate [options]\n\n"
-            << "options:\n"
-            << " -o out_file        name of the output file (defaults to \"video\").\n"
-            << " -d decoder         name of the libav decoder (hevc_cuvid, libx264 etc).\n"
-            << " -e encoder         name of the libav encoder (av1_nvenc, libx264, etc).\n"
-            << " -p preset          encoder preset (p1-p7 for nvenc, slow/medium/fast for x264).\n"
-            << " -q cq_value        constant quality value (0-51, lower = better quality).\n"
-            << " -b bitrate         target bitrate (e.g., 8M).\n"
-            << " -r framerate       output framerate (fps).\n"
-            << " -g gop_size        GOP size (keyframe interval).\n"
-            << " --pix-fmt format   pixel format (yuv420p, yuv444p, etc).\n"
-            << " --tune tune        tune setting (hq for high quality, etc).\n"
-            << " --spatial-aq val   spatial adaptive quantization (0 or 1).\n"
-            << " -T timestamp_file  name of time stamp file.\n"
-            << " -s start_time      time in sec since epoch.\n"
-            << " --end-time time    end time in sec since epoch." << std::endl;
+  std::cout
+    << "usage:\n\n"
+    << "bag_to_video -i input_bag -t topic -r framerate [options]\n\n"
+    << "options:\n"
+    << " -o out_file        name of the output file (defaults to \"video\").\n"
+    << " -d decoder         name of the libav decoder (hevc_cuvid, libx264 etc).\n"
+    << " -e encoder         name of the libav encoder (deprecated, use -E encoder:<name>).\n"
+    << " -E key:value       encoder options (can be specified multiple times):\n"
+    << "                    encoder:<name_of_encoder> (defaults to libx264)\n"
+    << "                    preset:<preset> (p1-p7 for nvenc, slow/medium/fast for x264)\n"
+    << "                    cq:<value> (constant quality, 0-51, lower = better)\n"
+    << "                    qmax:<value> (max quantization, 1 = best quality)\n"
+    << "                    bitrate:<value> (e.g., 8M)\n"
+    << "                    rc:<mode> (rate control mode, e.g., vbr, cbr)\n"
+    << "                    maxrate:<value> (max bitrate)\n"
+    << "                    bufsize:<value> (buffer size)\n"
+    << "                    gop_size:<value> (GOP size/keyframe interval)\n"
+    << "                    bf:<value> (max B-frames)\n"
+    << "                    max_b_frames:<value> (alias for bf)\n"
+    << "                    pix_fmt:<format> (pixel format: yuv420p, yuv444p, etc)\n"
+    << "                    tune:<value> (tune setting: hq, ll, etc)\n"
+    << "                    spatial-aq:<0|1> (spatial adaptive quantization)\n"
+    << "                    tier:<value> (encoding tier)\n"
+    << "                    profile:<value> (encoding profile)\n"
+    << "                    crf:<value> (constant rate factor)\n"
+    << "                    delay:<value> (encoding delay)\n"
+    << "                    bit_rate:<value> (alias for bitrate)\n"
+    << "                    cv_bridge_target_format:<format> (ROS format, e.g., rgb8)\n"
+    << "                    av_source_pixel_format:<format> (libav pixel format)\n"
+    << "                    measure_performance:<0|1> (enable performance measurement)\n"
+    << "                    (any other libav option following key:value syntax)\n"
+    << " -r framerate       output framerate (fps).\n"
+    << " -T timestamp_file  name of time stamp file.\n"
+    << " -s start_time      time in sec since epoch.\n"
+    << " --end-time time    end time in sec since epoch.\n"
+    << "\nDeprecated options (use -E instead):\n"
+    << " -p preset          use -E preset:<value>\n"
+    << " -q cq_value        use -E cq:<value>\n"
+    << " -b bitrate         use -E bitrate:<value>\n"
+    << " -g gop_size        use -E gop_size:<value>\n"
+    << " --pix-fmt format   use -E pix_fmt:<value>\n"
+    << " --tune tune        use -E tune:<value>\n"
+    << " --spatial-aq val   use -E spatial-aq:<value>" << std::endl;
 }
 
 using ffmpeg_encoder_decoder::Decoder;
@@ -77,7 +103,7 @@ class VideoWriter : public ffmpeg_image_transport_tools::MessageProcessor<FFMPEG
 public:
   VideoWriter(
     const std::vector<std::string> & decoders, const std::string & output_file,
-    const std::string & ts_file, const std::string & encoder_name = "av1_nvenc",
+    const std::string & ts_file, const std::string & encoder_name = "libx264",
     const std::map<std::string, std::string> & encoder_options = {}, double framerate = 30.0)
   : output_file_(output_file),
     decoder_names_(decoders),
@@ -293,6 +319,18 @@ static void convertToMP4(
   }
 }
 
+// Helper function to parse key:value pairs
+std::pair<std::string, std::string> parseKeyValue(const std::string & input)
+{
+  size_t colon_pos = input.find(':');
+  if (colon_pos == std::string::npos) {
+    throw std::runtime_error("Invalid key:value format: " + input);
+  }
+  std::string key = input.substr(0, colon_pos);
+  std::string value = input.substr(colon_pos + 1);
+  return {key, value};
+}
+
 int main(int argc, char ** argv)
 {
   int opt;
@@ -301,20 +339,16 @@ int main(int argc, char ** argv)
   std::string topic;
   std::string time_stamp_file = "timestamps.txt";
   std::string decoder;
-  std::string encoder = "av1_nvenc";
-  std::string preset = "p4";
-  std::string cq = "28";
-  std::string bitrate = "8M";
+  std::string encoder = "libx264";  // Default encoder
   std::string framerate = "30";
-  std::string gop_size = "40";
-  std::string pix_fmt = "yuv420p";
-  std::string tune = "hq";
-  std::string spatial_aq = "1";
+
+  // Map to store all encoder options
+  std::map<std::string, std::string> encoder_options;
 
   bag_time_t start_time = std::numeric_limits<bag_time_t>::min();
   bag_time_t end_time = std::numeric_limits<bag_time_t>::max();
 
-  while ((opt = getopt(argc, argv, "i:d:e:p:q:b:r:g:o:s:t:T:h")) != -1) {
+  while ((opt = getopt(argc, argv, "i:d:e:E:p:q:b:r:g:o:s:t:T:h")) != -1) {
     switch (opt) {
       case 'i':
         bag = optarg;
@@ -324,21 +358,52 @@ int main(int argc, char ** argv)
         break;
       case 'e':
         encoder = optarg;
+        RCLCPP_WARN(logger, "Option -e is deprecated, use -E encoder:<name> instead");
         break;
+      case 'E': {
+        try {
+          auto [key, value] = parseKeyValue(optarg);
+
+          // Special handling for encoder name
+          if (key == "encoder") {
+            encoder = value;
+          } else if (key == "bit_rate") {
+            // Map bit_rate to b:v for compatibility
+            encoder_options["b:v"] = value;
+          } else if (key == "bitrate") {
+            encoder_options["maxrate"] = value;
+          } else if (key == "max_b_frames") {
+            encoder_options["bf"] = value;
+          } else {
+            encoder_options[key] = value;
+          }
+
+          RCLCPP_INFO_STREAM(logger, "Encoder option: " << key << " = " << value);
+        } catch (const std::exception & e) {
+          std::cerr << "Error parsing -E option: " << e.what() << std::endl;
+          usage();
+          return -1;
+        }
+        break;
+      }
       case 'p':
-        preset = optarg;
+        encoder_options["preset"] = optarg;
+        RCLCPP_WARN(logger, "Option -p is deprecated, use -E preset:<value> instead");
         break;
       case 'q':
-        cq = optarg;
+        encoder_options["cq"] = optarg;
+        RCLCPP_WARN(logger, "Option -q is deprecated, use -E cq:<value> instead");
         break;
       case 'b':
-        bitrate = optarg;
+        encoder_options["maxrate"] = optarg;
+        RCLCPP_WARN(logger, "Option -b is deprecated, use -E bitrate:<value> instead");
         break;
       case 'r':
         framerate = optarg;
         break;
       case 'g':
-        gop_size = optarg;
+        encoder_options["g"] = optarg;
+        RCLCPP_WARN(logger, "Option -g is deprecated, use -E gop_size:<value> instead");
         break;
       case 'o':
         out_file = optarg;
@@ -381,20 +446,14 @@ int main(int argc, char ** argv)
     return (-1);
   }
 
-  // Setup encoder options based on your preferences
-  std::map<std::string, std::string> encoder_options;
-  encoder_options["preset"] = preset;
-  encoder_options["cq"] = cq;
-  encoder_options["rc"] = "vbr";
-  encoder_options["b:v"] = "0";
-  encoder_options["maxrate"] = bitrate;
-  encoder_options["bufsize"] = "16M";
-  encoder_options["g"] = gop_size;
-  encoder_options["bf"] = "0";
-  encoder_options["pix_fmt"] = pix_fmt;
-  encoder_options["tune"] = tune;
-  encoder_options["spatial-aq"] = spatial_aq;
-  encoder_options["tier"] = "0";
+  // Print final encoder configuration
+  RCLCPP_INFO_STREAM(logger, "Using encoder: " << encoder);
+  if (!encoder_options.empty()) {
+    RCLCPP_INFO(logger, "Encoder options:");
+    for (const auto & [key, value] : encoder_options) {
+      RCLCPP_INFO_STREAM(logger, "  " << key << ": " << value);
+    }
+  }
 
   const std::vector<std::string> topics{topic};
   const std::string topic_type = "ffmpeg_image_transport_msgs/msg/FFMPEGPacket";
