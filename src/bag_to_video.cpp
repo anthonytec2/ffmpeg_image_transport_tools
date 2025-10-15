@@ -1,4 +1,4 @@
-// -*-c++-*--------------------------------------------------------------------
+
 // Copyright 2024 Bernd Pfrommer <bernd.pfrommer@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -72,7 +72,8 @@ void usage()
     << "                    (any other libav option following key:value syntax)\n"
     << " -r framerate       output framerate (fps).\n"
     << " -T timestamp_file  name of time stamp file.\n"
-    << " -s start_time      time in sec since epoch.\n"
+    << " -s start_time      time in sec since epoch (filters bag reading).\n"
+    << " -S encode_start    time in sec since epoch (filters encoding only).\n"
     << " --end-time time    end time in sec since epoch.\n"
     << "\nDeprecated options (use -E instead):\n"
     << " -p preset          use -E preset:<value>\n"
@@ -104,19 +105,29 @@ public:
   VideoWriter(
     const std::vector<std::string> & decoders, const std::string & output_file,
     const std::string & ts_file, const std::string & encoder_name = "libx264",
-    const std::map<std::string, std::string> & encoder_options = {}, double framerate = 30.0)
+    const std::map<std::string, std::string> & encoder_options = {}, double framerate = 30.0,
+    bag_time_t encode_start_time = std::numeric_limits<bag_time_t>::min())
   : output_file_(output_file),
     decoder_names_(decoders),
     encoder_name_(encoder_name),
     encoder_options_(encoder_options),
-    framerate_(framerate)
+    framerate_(framerate),
+    encode_start_time_(encode_start_time)
   {
     ts_file_.open(ts_file);
     encoded_ts_file_.open(ts_file + "_encoded");
 
     // Initialize encoder with options
     for (const auto & [key, value] : encoder_options_) {
-      encoder_.addAVOption(key, value);
+      if (key == "pix_fmt") {
+        // Handle pixel format specially - it's set on the encoder before initialization
+        encoder_.setAVSourcePixelFormat(value);
+      } else if (key == "cv_bridge_target_format") {
+        // Handle cv_bridge target format specially
+        encoder_.setCVBridgeTargetFormat(value);
+      } else {
+        encoder_.addAVOption(key, value);
+      }
     }
   }
 
@@ -133,6 +144,9 @@ public:
             split_by_char(Decoder::findDecoders(split_by_char(m->encoding, ';')[0]), ',');
         }
       }
+      // Force decoder to output BGR8 for proper color conversion from Bayer
+      decoder_.setOutputMessageEncoding("bgr8");
+      
       while (!decoder_names_.empty()) {
         const auto name = *decoder_names_.begin();
         decoder_names_.erase(decoder_names_.begin());  // mark as used
@@ -185,8 +199,11 @@ public:
       auto it = ptsToPacketInfo_.find(pts);
       if (it != ptsToPacketInfo_.end()) {
         const auto & info = it->second;
-        ts_file_ << info.packet_number << " " << pts << " " << info.stamp_ns << " " << info.recv_ns
-                 << std::endl;
+        // Only write timestamp if this frame will be encoded (not filtered out)
+        if (info.stamp_ns >= encode_start_time_) {
+          ts_file_ << info.packet_number << " " << pts << " " << info.stamp_ns << " " 
+                   << info.recv_ns << std::endl;
+        }
         ptsToPacketInfo_.erase(it);  // Remove after writing to prevent memory buildup
       } else {
         RCLCPP_WARN_STREAM(logger, "Could not find packet info for decoded PTS: " << pts);
@@ -196,6 +213,16 @@ public:
 
   void callback(const Image::ConstSharedPtr & msg, bool, const std::string & avPixFmt)
   {
+    // Filter frames before encode_start_time_
+    const int64_t frame_time_ns = Time(msg->header.stamp).nanoseconds();
+    if (frame_time_ns < encode_start_time_) {
+      if (!skipping_frames_logged_) {
+        RCLCPP_INFO_STREAM(logger, "Skipping frames before encode start time: " << encode_start_time_);
+        skipping_frames_logged_ = true;
+      }
+      return;  // Exit early - don't encode this frame
+    }
+
     if (!encoder_.isInitialized()) {
       // Initialize encoder with the first frame
       RCLCPP_INFO_STREAM(logger, "initializing encoder " << encoder_name_);
@@ -289,13 +316,16 @@ private:
   std::ofstream encoded_ts_file_;
   size_t frame_number_{0};
   size_t encoded_frame_number_{0};
+  size_t decoded_frame_number_{0};
   Decoder decoder_;
   Encoder encoder_;
   size_t packet_number_{0};
+  bag_time_t encode_start_time_;
   bool firstTime_{true};
   bool waitForKeyFrame_{false};
   bool waitingForKeyFrame_{false};
   bool printedHeader_{false};
+  bool skipping_frames_logged_{false};
 };
 
 static void convertToMP4(
@@ -347,8 +377,9 @@ int main(int argc, char ** argv)
 
   bag_time_t start_time = std::numeric_limits<bag_time_t>::min();
   bag_time_t end_time = std::numeric_limits<bag_time_t>::max();
+  bag_time_t encode_start_time = std::numeric_limits<bag_time_t>::min();
 
-  while ((opt = getopt(argc, argv, "i:d:e:E:p:q:b:r:g:o:s:t:T:h")) != -1) {
+  while ((opt = getopt(argc, argv, "i:d:e:E:p:q:b:r:g:o:s:S:t:T:h")) != -1) {
     switch (opt) {
       case 'i':
         bag = optarg;
@@ -417,6 +448,15 @@ int main(int argc, char ** argv)
           return (-1);
         }
         break;
+      case 'S':
+        encode_start_time = static_cast<bag_time_t>(atof(optarg) * 1e9);
+        if (encode_start_time < 0) {
+          std::cout << "encode start time out of range, must be in seconds since start of epoch"
+                    << std::endl;
+          usage();
+          return (-1);
+        }
+        break;
       case 't':
         topic = optarg;
         break;
@@ -466,7 +506,8 @@ int main(int argc, char ** argv)
   }
 
   VideoWriter vw(
-    decoders, out_file, time_stamp_file, encoder, encoder_options, std::stod(framerate));
+    decoders, out_file, time_stamp_file, encoder, encoder_options, std::stod(framerate),
+    encode_start_time);
   bproc.process(&vw);
 
   // Flush the encoder and close files
