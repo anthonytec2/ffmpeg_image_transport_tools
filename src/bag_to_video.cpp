@@ -125,6 +125,9 @@ public:
       } else if (key == "cv_bridge_target_format") {
         // Handle cv_bridge target format specially
         encoder_.setCVBridgeTargetFormat(value);
+      } else if (key == "measure_performance") {
+        // Enable/disable performance measurement
+        encoder_.setMeasurePerformance(value == "1" || value == "true");
       } else {
         encoder_.addAVOption(key, value);
       }
@@ -144,14 +147,20 @@ public:
             split_by_char(Decoder::findDecoders(split_by_char(m->encoding, ';')[0]), ',');
         }
       }
-      // Force decoder to output BGR8 for proper color conversion from Bayer
-      decoder_.setOutputMessageEncoding("bgr8");
+      // Use raw AVFrame delivery to avoid ROS Image conversions
+      // Enable decoder perf measurement if requested
+      auto it = encoder_options_.find("measure_performance");
+      if (it != encoder_options_.end() && (it->second == "1" || it->second == "true")) {
+        decoder_.setMeasurePerformance(true);
+      }
       
       while (!decoder_names_.empty()) {
         const auto name = *decoder_names_.begin();
         decoder_names_.erase(decoder_names_.begin());  // mark as used
-        if (!decoder_.initialize(
-              m->encoding, std::bind(&VideoWriter::callback, this, _1, _2, _3), name)) {
+        if (!decoder_.initializeRaw(
+              m->encoding,
+              std::bind(&VideoWriter::rawCallback, this, _1, _2, _3, _4, _5),
+              name)) {
           RCLCPP_ERROR_STREAM(
             logger, "cannot initialize decoder " << name << " for encoding: " << m->encoding);
         } else {
@@ -211,52 +220,53 @@ public:
     }
   }
 
-  void callback(const Image::ConstSharedPtr & msg, bool, const std::string & avPixFmt)
+  void rawCallback(
+    const AVFrame * frame, const std::string & avPixFmt, const std::string & frame_id,
+    const rclcpp::Time & stamp, bool)
   {
     // Filter frames before encode_start_time_
-    const int64_t frame_time_ns = Time(msg->header.stamp).nanoseconds();
+    const int64_t frame_time_ns = stamp.nanoseconds();
     if (frame_time_ns < encode_start_time_) {
       if (!skipping_frames_logged_) {
         RCLCPP_INFO_STREAM(logger, "Skipping frames before encode start time: " << encode_start_time_);
         skipping_frames_logged_ = true;
       }
-      return;  // Exit early - don't encode this frame
+      return;
     }
 
     if (!encoder_.isInitialized()) {
-      // Initialize encoder with the first frame
       RCLCPP_INFO_STREAM(logger, "initializing encoder " << encoder_name_);
-
       auto encode_callback = [this](
-                               const std::string & frame_id, const rclcpp::Time & stamp,
+                               const std::string & frame_id2, const rclcpp::Time & stamp2,
                                const std::string & codec, uint32_t width, uint32_t height,
                                uint64_t pts, uint8_t flags, uint8_t * data, size_t sz) {
-        this->encodeCallback(frame_id, stamp, codec, width, height, pts, flags, data, sz);
+        this->encodeCallback(frame_id2, stamp2, codec, width, height, pts, flags, data, sz);
       };
-
       encoder_.setEncoder(encoder_name_);
-      if (!encoder_.initialize(msg->width, msg->height, encode_callback, msg->encoding)) {
+      // Match encoder input to decoder output format to avoid sws_scale
+      encoder_.setAVSourcePixelFormat(avPixFmt);
+      if (!encoder_.initialize(frame->width, frame->height, encode_callback, avPixFmt)) {
         RCLCPP_ERROR_STREAM(logger, "failed to initialize encoder: " << encoder_name_);
         throw std::runtime_error("encoder initialization failed");
       }
-
       // Open output file based on codec
       codec_ext_ = getCodecExtension();
       raw_file_.open(output_file_ + "." + codec_ext_, std::ios::binary);
       RCLCPP_INFO_STREAM(logger, "writing encoded packets to: " << output_file_ + "." + codec_ext_);
+      if (!printedHeader_) {
+        RCLCPP_INFO_STREAM(
+          logger, "libav pix fmt: " << avPixFmt << " " << frame->width << "x" << frame->height);
+        printedHeader_ = true;
+      }
     }
 
-    if (!printedHeader_) {
-      RCLCPP_INFO_STREAM(
-        logger, "ros encoding: " << msg->encoding << " " << msg->width << "x" << msg->height
-                                 << " step: " << msg->step << " libav pix fmt: " << avPixFmt);
-      printedHeader_ = true;
-    }
+    // Build minimal header
+    ffmpeg_encoder_decoder::Header header;
+    header.frame_id = frame_id;
+    header.stamp = stamp;
+    encoder_.encodeAVFrame(frame, header, rclcpp::Clock().now());
 
-    // Encode the frame
-    encoder_.encodeImage(*msg);
-
-    if (++frame_number_ % 100 == 0) {
+    if (++frame_number_ % 500 == 0) {
       RCLCPP_INFO_STREAM(logger, "encoded " << frame_number_ << " frames.");
     }
   }
@@ -290,6 +300,10 @@ public:
   {
     if (encoder_.isInitialized()) {
       encoder_.flush();
+      encoder_.printTimers("ENCODER");
+    }
+    if (decoder_.isInitialized()) {
+      decoder_.printTimers("DECODER");
     }
     raw_file_.close();
     ts_file_.close();
