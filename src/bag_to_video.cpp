@@ -115,7 +115,7 @@ public:
     encode_start_time_(encode_start_time)
   {
     ts_file_.open(ts_file);
-    encoded_ts_file_.open(ts_file + "_encoded");
+    encoded_ts_file_.open("/tmp/" + ts_file + "_encoded");
 
     // Initialize encoder with options
     for (const auto & [key, value] : encoder_options_) {
